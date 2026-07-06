@@ -11,8 +11,9 @@ import (
 	"golang.org/x/net/idna"
 )
 
-// providerPartLookup is a custom IDNA profile used to normalize and validate
-// the individual parts (namespace and type) of a provider source address.
+// providerNamespaceLookup is a custom IDNA profile used to normalize and
+// validate a provider source address namespace, which (unlike a provider type)
+// is permitted to contain underscores.
 //
 // It mirrors the standard idna.Lookup profile, which provides the canonical
 // normalization (case folding, Unicode normalization) that allows two
@@ -23,26 +24,29 @@ import (
 // Terraform Cloud allows underscores in organization names and uses that name
 // as the provider namespace in its private registry, so provider source
 // addresses such as "app.terraform.io/openai_inc/kube" must be accepted.
+// Underscores remain invalid in a provider type because of language-level
+// constraints in Terraform (e.g. "hashicorp/google_beta" is not a valid type),
+// so only the namespace is parsed with this profile.
 //
 // Disabling StrictDomainName also relaxes the rules to allow other special
-// ASCII characters, so ParseProviderPart performs an additional validation
+// ASCII characters, so parseProviderPart performs an additional validation
 // check to ensure only underscores (and the already-permitted letters, digits,
-// and dashes) are allowed; see disallowedProviderPartRune.
-var providerPartLookup = idna.New(
+// and dashes) are allowed; see disallowedNamespaceRune.
+var providerNamespaceLookup = idna.New(
 	idna.MapForLookup(),
 	idna.BidiRule(),
 	idna.StrictDomainName(false),
 )
 
-// disallowedProviderPartRune reports whether r is an ASCII character that is
-// not permitted in a provider part. Disabling StrictDomainName in the IDNA
-// profile would otherwise allow special ASCII characters such as '!', '$' or
-// '%'; we only want to additionally permit the underscore, so we reject any
+// disallowedNamespaceRune reports whether r is an ASCII character that is
+// not permitted in a provider namespace. Disabling StrictDomainName in the
+// IDNA profile would otherwise allow special ASCII characters such as '!', '$'
+// or '%'; we only want to additionally permit the underscore, so we reject any
 // other ASCII character that isn't a letter, digit, dash, or underscore.
 //
 // Non-ASCII runes are left to the IDNA profile to validate so that
 // international names continue to be normalized and accepted as before.
-func disallowedProviderPartRune(r rune) bool {
+func disallowedNamespaceRune(r rune) bool {
 	if r > 127 {
 		return false
 	}
@@ -150,7 +154,7 @@ func NewProvider(hostname svchost.Hostname, namespace, typeName string) Provider
 
 	return Provider{
 		Type:      MustParseProviderPart(typeName),
-		Namespace: MustParseProviderPart(namespace),
+		Namespace: mustParseProviderNamespace(namespace),
 		Hostname:  hostname,
 	}
 }
@@ -344,7 +348,7 @@ func ParseProviderSource(str string) (Provider, error) {
 			// or else we'd get errors round-tripping through legacy subsystems.
 			ret.Namespace = LegacyProviderNamespace
 		} else {
-			namespace, err := ParseProviderPart(givenNamespace)
+			namespace, err := parseProviderNamespace(givenNamespace)
 			if err != nil {
 				return Provider{}, &ParserError{
 					Summary: "Invalid provider namespace",
@@ -504,9 +508,9 @@ func parseSourceStringParts(str string) ([]string, error) {
 	return parts, nil
 }
 
-// ParseProviderPart processes an addrs.Provider namespace or type string
-// provided by an end-user, producing a normalized version if possible or
-// an error if the string contains invalid characters.
+// ParseProviderPart processes an addrs.Provider type string provided by an
+// end-user, producing a normalized version if possible or an error if the
+// string contains invalid characters.
 //
 // A provider part is processed in the same way as an individual label in a DNS
 // domain name: it is transformed to lowercase per the usual DNS case mapping
@@ -528,9 +532,49 @@ func parseSourceStringParts(str string) ([]string, error) {
 // "google-beta" variant of the GCP provider, which has resource types that
 // start with the "google_" prefix instead.)
 //
+// Underscores are not permitted. Provider namespaces (as opposed to types) may
+// contain underscores because Terraform Cloud allows them in organization
+// names, but that is a property of the namespace only and is handled by
+// ParseProviderSource; a provider type such as "google_beta" remains invalid.
+//
 // It's valid to pass the result of this function as the argument to a
 // subsequent call, in which case the result will be identical.
 func ParseProviderPart(given string) (string, error) {
+	return parseProviderPart(given, false)
+}
+
+// MustParseProviderPart is a wrapper around ParseProviderPart that panics if
+// it returns an error.
+func MustParseProviderPart(given string) string {
+	result, err := ParseProviderPart(given)
+	if err != nil {
+		panic(err.Error())
+	}
+	return result
+}
+
+// parseProviderNamespace is like ParseProviderPart but additionally permits
+// underscores, which are valid in a provider namespace (a Terraform Cloud
+// organization name) even though they are not valid in a provider type.
+func parseProviderNamespace(given string) (string, error) {
+	return parseProviderPart(given, true)
+}
+
+// mustParseProviderNamespace is a wrapper around parseProviderNamespace that
+// panics if it returns an error.
+func mustParseProviderNamespace(given string) string {
+	result, err := parseProviderNamespace(given)
+	if err != nil {
+		panic(err.Error())
+	}
+	return result
+}
+
+// parseProviderPart is the shared implementation behind ParseProviderPart and
+// parseProviderNamespace. When allowUnderscores is true the value may also
+// contain underscores (but not as a leading or trailing character); otherwise
+// only letters, digits, and dashes are permitted.
+func parseProviderPart(given string, allowUnderscores bool) (string, error) {
 	if len(given) == 0 {
 		return "", fmt.Errorf("must have at least one character")
 	}
@@ -555,35 +599,33 @@ func ParseProviderPart(given string) (string, error) {
 		return "", fmt.Errorf("cannot use multiple consecutive dashes")
 	}
 
-	// Disallow special ASCII characters that would otherwise be permitted now
-	// that StrictDomainName is disabled in our IDNA profile. We only intend to
-	// additionally permit underscores beyond the standard letters, digits, and
-	// dashes; characters such as '!', '$' or '%' remain invalid.
-	if strings.IndexFunc(given, disallowedProviderPartRune) != -1 {
-		return "", fmt.Errorf("must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores")
+	profile := idna.Lookup
+	invalidErr := fmt.Errorf("must contain only letters, digits, and dashes, and may not use leading or trailing dashes")
+
+	if allowUnderscores {
+		profile = providerNamespaceLookup
+		invalidErr = fmt.Errorf("must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores")
+
+		// Disabling StrictDomainName in providerNamespaceLookup would otherwise
+		// permit other special ASCII characters such as '!', '$' or '%'; we
+		// only intend to additionally permit underscores, so reject anything
+		// else.
+		if strings.IndexFunc(given, disallowedNamespaceRune) != -1 {
+			return "", invalidErr
+		}
+
+		// Underscores are permitted as interior punctuation, but not as a
+		// leading or trailing character, matching the existing restriction on
+		// dashes (which is enforced by the IDNA profile's hyphen checks).
+		if strings.HasPrefix(given, "_") || strings.HasSuffix(given, "_") {
+			return "", invalidErr
+		}
 	}
 
-	// Underscores are permitted as interior punctuation, but not as a leading
-	// or trailing character, matching the existing restriction on dashes (which
-	// is enforced by the IDNA profile's hyphen checks).
-	if strings.HasPrefix(given, "_") || strings.HasSuffix(given, "_") {
-		return "", fmt.Errorf("must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores")
-	}
-
-	result, err := providerPartLookup.ToUnicode(given)
+	result, err := profile.ToUnicode(given)
 	if err != nil {
-		return "", fmt.Errorf("must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores")
+		return "", invalidErr
 	}
 
 	return result, nil
-}
-
-// MustParseProviderPart is a wrapper around ParseProviderPart that panics if
-// it returns an error.
-func MustParseProviderPart(given string) string {
-	result, err := ParseProviderPart(given)
-	if err != nil {
-		panic(err.Error())
-	}
-	return result
 }

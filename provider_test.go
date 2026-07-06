@@ -503,6 +503,17 @@ func TestParseProviderSource(t *testing.T) {
 			Provider{},
 			true,
 		},
+		// Underscores are permitted only in the namespace, not the provider
+		// type, because Terraform disallows underscores in provider type names
+		// (e.g. "hashicorp/google_beta" is invalid at the language level).
+		"hashicorp/google_beta": {
+			Provider{},
+			true,
+		},
+		"app.terraform.io/my_org/google_beta": {
+			Provider{},
+			true,
+		},
 		"foo-bar/baz-boop": {
 			Provider{
 				Type:      "baz-boop",
@@ -659,59 +670,27 @@ func TestParseProviderPart(t *testing.T) {
 		},
 		`-abc123`: {
 			``,
-			`must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores`,
+			`must contain only letters, digits, and dashes, and may not use leading or trailing dashes`,
 		},
 		`abc123-`: {
 			``,
-			`must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores`,
+			`must contain only letters, digits, and dashes, and may not use leading or trailing dashes`,
 		},
-		// Underscores are permitted because Terraform Cloud allows them in
-		// organization names, which become provider namespaces.
-		`openai_inc`: {
-			`openai_inc`,
+		// Underscores are NOT permitted in a provider type, even though they are
+		// allowed in a namespace (see TestParseProviderNamespace). Terraform
+		// disallows underscores in provider type names at the language level, so
+		// e.g. "google_beta" must be rejected here.
+		`google_beta`: {
 			``,
-		},
-		`my_org`: {
-			`my_org`,
-			``,
-		},
-		`Org_Name`: { // underscores must not interfere with case folding
-			`org_name`,
-			``,
+			`must contain only letters, digits, and dashes, and may not use leading or trailing dashes`,
 		},
 		`abc_123`: {
-			`abc_123`,
 			``,
+			`must contain only letters, digits, and dashes, and may not use leading or trailing dashes`,
 		},
-		// Underscores may not lead or trail, matching the dash restriction.
-		`_leading`: {
+		`openai_inc`: {
 			``,
-			`must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores`,
-		},
-		`trailing_`: {
-			``,
-			`must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores`,
-		},
-		`_`: {
-			``,
-			`must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores`,
-		},
-		// Other special ASCII characters remain disallowed.
-		`abc!123`: {
-			``,
-			`must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores`,
-		},
-		`abc$123`: {
-			``,
-			`must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores`,
-		},
-		`abc%123`: {
-			``,
-			`must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores`,
-		},
-		`abc 123`: {
-			``,
-			`must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores`,
+			`must contain only letters, digits, and dashes, and may not use leading or trailing dashes`,
 		},
 		``: {
 			``,
@@ -722,6 +701,99 @@ func TestParseProviderPart(t *testing.T) {
 	for given, test := range tests {
 		t.Run(given, func(t *testing.T) {
 			got, err := ParseProviderPart(given)
+			if test.Error != "" {
+				if err == nil {
+					t.Errorf("unexpected success\ngot:  %s\nwant: %s", err, test.Error)
+				} else if got := err.Error(); got != test.Error {
+					t.Errorf("wrong error\ngot:  %s\nwant: %s", got, test.Error)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error\ngot:  %s\nwant: <nil>", err)
+				} else if got != test.Want {
+					t.Errorf("wrong result\ngot:  %s\nwant: %s", got, test.Want)
+				}
+			}
+		})
+	}
+}
+
+// TestParseProviderNamespace covers the underscore handling that is specific to
+// provider namespaces. Underscores are permitted here (Terraform Cloud allows
+// them in organization names) but not in provider types; see
+// TestParseProviderPart for the stricter type rules.
+func TestParseProviderNamespace(t *testing.T) {
+	const underscoreErr = `must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores`
+
+	tests := map[string]struct {
+		Want  string
+		Error string
+	}{
+		// Plain names continue to work exactly as for a provider type.
+		`hashicorp`: {
+			`hashicorp`,
+			``,
+		},
+		`foo-bar`: {
+			`foo-bar`,
+			``,
+		},
+		// Underscores are permitted anywhere except as a leading/trailing rune.
+		`openai_inc`: {
+			`openai_inc`,
+			``,
+		},
+		`my_org`: {
+			`my_org`,
+			``,
+		},
+		`abc_123`: {
+			`abc_123`,
+			``,
+		},
+		`Org_Name`: { // underscores must not interfere with case folding
+			`org_name`,
+			``,
+		},
+		// Underscores may not lead or trail, matching the dash restriction.
+		`_leading`: {
+			``,
+			underscoreErr,
+		},
+		`trailing_`: {
+			``,
+			underscoreErr,
+		},
+		`_`: {
+			``,
+			underscoreErr,
+		},
+		// Other special ASCII characters remain disallowed.
+		`abc!123`: {
+			``,
+			underscoreErr,
+		},
+		`abc$123`: {
+			``,
+			underscoreErr,
+		},
+		`abc%123`: {
+			``,
+			underscoreErr,
+		},
+		`abc 123`: {
+			``,
+			underscoreErr,
+		},
+		``: {
+			``,
+			`must have at least one character`,
+		},
+	}
+
+	for given, test := range tests {
+		t.Run(given, func(t *testing.T) {
+			got, err := parseProviderNamespace(given)
 			if test.Error != "" {
 				if err == nil {
 					t.Errorf("unexpected success\ngot:  %s\nwant: %s", err, test.Error)
