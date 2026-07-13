@@ -755,6 +755,13 @@ func TestParseProviderNamespace(t *testing.T) {
 			`org_name`,
 			``,
 		},
+		// Consecutive underscores are intentionally allowed: Terraform Cloud
+		// permits them in organization names (unlike consecutive dashes, which
+		// are rejected to avoid the "xn--" punycode prefix).
+		`foo__bar`: {
+			`foo__bar`,
+			``,
+		},
 		// Underscores may not lead or trail, matching the dash restriction.
 		`_leading`: {
 			``,
@@ -793,7 +800,7 @@ func TestParseProviderNamespace(t *testing.T) {
 
 	for given, test := range tests {
 		t.Run(given, func(t *testing.T) {
-			got, err := parseProviderNamespace(given)
+			got, err := ParseProviderNamespace(given)
 			if test.Error != "" {
 				if err == nil {
 					t.Errorf("unexpected success\ngot:  %s\nwant: %s", err, test.Error)

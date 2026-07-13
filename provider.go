@@ -11,59 +11,6 @@ import (
 	"golang.org/x/net/idna"
 )
 
-// providerNamespaceLookup is a custom IDNA profile used to normalize and
-// validate a provider source address namespace, which (unlike a provider type)
-// is permitted to contain underscores.
-//
-// It mirrors the standard idna.Lookup profile, which provides the canonical
-// normalization (case folding, Unicode normalization) that allows two
-// addresses to be compared and sorted reliably. The one difference is that
-// StrictDomainName (the STD3 rules) is disabled, which permits underscores in
-// addition to letters, digits, and dashes.
-//
-// Terraform Cloud allows underscores in organization names and uses that name
-// as the provider namespace in its private registry, so provider source
-// addresses such as "app.terraform.io/openai_inc/kube" must be accepted.
-// Underscores remain invalid in a provider type because of language-level
-// constraints in Terraform (e.g. "hashicorp/google_beta" is not a valid type),
-// so only the namespace is parsed with this profile.
-//
-// Disabling StrictDomainName also relaxes the rules to allow other special
-// ASCII characters, so normalizeProviderNamespace performs an additional
-// validation check to ensure only underscores (and the already-permitted
-// letters, digits, and dashes) are allowed; see disallowedNamespaceRune.
-var providerNamespaceLookup = idna.New(
-	idna.MapForLookup(),
-	idna.BidiRule(),
-	idna.StrictDomainName(false),
-)
-
-// disallowedNamespaceRune reports whether r is an ASCII character that is
-// not permitted in a provider namespace. Disabling StrictDomainName in the
-// IDNA profile would otherwise allow special ASCII characters such as '!', '$'
-// or '%'; we only want to additionally permit the underscore, so we reject any
-// other ASCII character that isn't a letter, digit, dash, or underscore.
-//
-// Non-ASCII runes are left to the IDNA profile to validate so that
-// international names continue to be normalized and accepted as before.
-func disallowedNamespaceRune(r rune) bool {
-	if r > 127 {
-		return false
-	}
-	switch {
-	case r >= 'a' && r <= 'z':
-		return false
-	case r >= 'A' && r <= 'Z':
-		return false
-	case r >= '0' && r <= '9':
-		return false
-	case r == '-' || r == '_':
-		return false
-	default:
-		return true
-	}
-}
-
 // Provider encapsulates a single provider type. In the future this will be
 // extended to include additional fields including Namespace and SourceHost
 type Provider struct {
@@ -154,7 +101,7 @@ func NewProvider(hostname svchost.Hostname, namespace, typeName string) Provider
 
 	return Provider{
 		Type:      MustParseProviderPart(typeName),
-		Namespace: mustParseProviderNamespace(namespace),
+		Namespace: MustParseProviderNamespace(namespace),
 		Hostname:  hostname,
 	}
 }
@@ -348,7 +295,7 @@ func ParseProviderSource(str string) (Provider, error) {
 			// or else we'd get errors round-tripping through legacy subsystems.
 			ret.Namespace = LegacyProviderNamespace
 		} else {
-			namespace, err := parseProviderNamespace(givenNamespace)
+			namespace, err := ParseProviderNamespace(givenNamespace)
 			if err != nil {
 				return Provider{}, &ParserError{
 					Summary: "Invalid provider namespace",
@@ -532,15 +479,13 @@ func parseSourceStringParts(str string) ([]string, error) {
 // "google-beta" variant of the GCP provider, which has resource types that
 // start with the "google_" prefix instead.)
 //
-// Underscores are not permitted. Provider namespaces (as opposed to types) may
-// contain underscores because Terraform Cloud allows them in organization
-// names, but that is a property of the namespace only and is handled by
-// ParseProviderSource; a provider type such as "google_beta" remains invalid.
+// Underscores are not permitted; namespaces have relaxed rules and are parsed
+// with ParseProviderNamespace instead.
 //
 // It's valid to pass the result of this function as the argument to a
 // subsequent call, in which case the result will be identical.
 func ParseProviderPart(given string) (string, error) {
-	return parseProviderPart(given, normalizeProviderType)
+	return parseProviderPart(given, normalizeProviderPart)
 }
 
 // MustParseProviderPart is a wrapper around ParseProviderPart that panics if
@@ -553,35 +498,31 @@ func MustParseProviderPart(given string) string {
 	return result
 }
 
-// parseProviderNamespace is like ParseProviderPart but additionally permits
-// underscores, which are valid in a provider namespace (a Terraform Cloud
-// organization name) even though they are not valid in a provider type.
-func parseProviderNamespace(given string) (string, error) {
+// ParseProviderNamespace is like ParseProviderPart but additionally permits
+// underscores, which Terraform Cloud allows in the organization names it uses
+// as provider namespaces. Underscores remain invalid in a provider type, so
+// e.g. "google_beta" must still be parsed with ParseProviderPart and rejected.
+func ParseProviderNamespace(given string) (string, error) {
 	return parseProviderPart(given, normalizeProviderNamespace)
 }
 
-// mustParseProviderNamespace is a wrapper around parseProviderNamespace that
+// MustParseProviderNamespace is a wrapper around ParseProviderNamespace that
 // panics if it returns an error.
-func mustParseProviderNamespace(given string) string {
-	result, err := parseProviderNamespace(given)
+func MustParseProviderNamespace(given string) string {
+	result, err := ParseProviderNamespace(given)
 	if err != nil {
 		panic(err.Error())
 	}
 	return result
 }
 
-// partNormalizer validates the character rules that are specific to a kind of
-// provider address part (a type or a namespace) and returns the normalized form
-// of the part. The checks common to every part are applied by parseProviderPart
-// before the normalizer is called.
-type partNormalizer func(given string) (string, error)
+// providerPartNormalizer applies the character rules specific to one kind of
+// provider address part, returning the part's normalized form.
+type providerPartNormalizer func(given string) (string, error)
 
-// parseProviderPart applies the validation common to every provider address
-// part and then defers to normalize for the part-specific character rules.
-// Passing the part-specific behavior in as a function (rather than branching on
-// a flag) keeps the type and namespace rules encapsulated and independently
-// readable.
-func parseProviderPart(given string, normalize partNormalizer) (string, error) {
+// parseProviderPart applies the validation shared by every provider address
+// part, then defers to normalize for the part-specific rules.
+func parseProviderPart(given string, normalize providerPartNormalizer) (string, error) {
 	if len(given) == 0 {
 		return "", fmt.Errorf("must have at least one character")
 	}
@@ -609,9 +550,11 @@ func parseProviderPart(given string, normalize partNormalizer) (string, error) {
 	return normalize(given)
 }
 
-// normalizeProviderType permits only letters, digits, and dashes, which are the
-// characters allowed in a provider type.
-func normalizeProviderType(given string) (string, error) {
+// normalizeProviderPart applies the standard DNS-label normalization used for
+// hostnames, which permits only letters, digits, and dashes. Provider types
+// share these rules with the hostname part of an address; only namespaces
+// diverge (see normalizeProviderNamespace).
+func normalizeProviderPart(given string) (string, error) {
 	result, err := idna.Lookup.ToUnicode(given)
 	if err != nil {
 		return "", fmt.Errorf("must contain only letters, digits, and dashes, and may not use leading or trailing dashes")
@@ -619,28 +562,47 @@ func normalizeProviderType(given string) (string, error) {
 	return result, nil
 }
 
-// normalizeProviderNamespace permits underscores in addition to letters,
-// digits, and dashes (but not as a leading or trailing character), because
-// Terraform Cloud allows underscores in the organization names it uses as
-// provider namespaces.
+// normalizeProviderNamespace additionally permits underscores (though not as a
+// leading or trailing character), which Terraform Cloud allows in the
+// organization names it uses as provider namespaces.
 func normalizeProviderNamespace(given string) (string, error) {
 	invalidErr := fmt.Errorf("must contain only letters, digits, dashes, and underscores, and may not use leading or trailing dashes or underscores")
 
-	// Disabling StrictDomainName in providerNamespaceLookup would otherwise
-	// permit other special ASCII characters such as '!', '$' or '%'; we only
-	// intend to additionally permit underscores, so reject anything else.
-	if strings.IndexFunc(given, disallowedNamespaceRune) != -1 {
+	// The relaxed IDNA profile below would also admit special ASCII characters
+	// such as '!' or '$', so reject any ASCII character that isn't a letter,
+	// digit, dash, or underscore. Non-ASCII runes are left to the profile so
+	// that international names normalize as before.
+	disallowed := func(r rune) bool {
+		switch {
+		case r > 127,
+			r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-', r == '_':
+			return false
+		default:
+			return true
+		}
+	}
+	if strings.IndexFunc(given, disallowed) != -1 {
 		return "", invalidErr
 	}
 
-	// Underscores are permitted as interior punctuation, but not as a leading
-	// or trailing character, matching the existing restriction on dashes (which
-	// is enforced by the IDNA profile's hyphen checks).
+	// No leading or trailing underscores, matching the restriction on dashes
+	// (which the IDNA profile's hyphen checks enforce).
 	if strings.HasPrefix(given, "_") || strings.HasSuffix(given, "_") {
 		return "", invalidErr
 	}
 
-	result, err := providerNamespaceLookup.ToUnicode(given)
+	// Mirrors the standard idna.Lookup profile but with StrictDomainName (the
+	// STD3 rules) disabled so that underscores are permitted; case folding and
+	// Unicode normalization are unchanged.
+	namespaceLookup := idna.New(
+		idna.MapForLookup(),
+		idna.BidiRule(),
+		idna.StrictDomainName(false),
+	)
+	result, err := namespaceLookup.ToUnicode(given)
 	if err != nil {
 		return "", invalidErr
 	}
